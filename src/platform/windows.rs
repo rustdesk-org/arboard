@@ -229,7 +229,7 @@ mod image_data {
 		let pixel_data_start = if has_profile {
 			header.bV5ProfileData as isize + header.bV5ProfileSize as isize
 		} else {
-			header_size as isize
+			(header_size + appended_bitfield_mask_len(header, dibv5.len())) as isize
 		};
 
 		unsafe {
@@ -287,6 +287,53 @@ mod image_data {
 		Present,
 		Missing,
 		Unknown,
+	}
+
+	/// Length of a `BI_BITFIELDS` colour-mask block appended *after* the
+	/// header, or 0 when the pixel data follows the header directly.
+	///
+	/// `BITMAPV5HEADER` already carries the masks as `bV5RedMask`,
+	/// `bV5GreenMask` and `bV5BlueMask`, so per the spec pixel data begins at
+	/// `bV5Size`. Windows' own `CF_DIB` -> `CF_DIBV5` synthesis nevertheless
+	/// emits the three masks again between the header and the pixels, so any
+	/// image placed on the clipboard as a plain `DataFormats.Bitmap` (which is
+	/// what most Windows applications do) arrives in that layout. Reading such
+	/// a blob at `bV5Size` starts 12 bytes early; at 32bpp that is exactly 3
+	/// pixels, which shifts the whole image and wraps each row's last three
+	/// columns onto the left edge of the next one.
+	///
+	/// The two layouts are distinguished by the buffer length: the mask block
+	/// is only skipped when the buffer is genuinely large enough to hold it in
+	/// addition to a full image, so producers that follow the spec keep
+	/// working.
+	fn appended_bitfield_mask_len(header: &BITMAPV5HEADER, total_len: usize) -> usize {
+		const MASK_LEN: usize = 3 * size_of::<u32>();
+
+		if header.bV5Compression != BI_BITFIELDS {
+			return 0;
+		}
+
+		let width = header.bV5Width.unsigned_abs() as usize;
+		let height = header.bV5Height.unsigned_abs() as usize;
+		let bit_count = header.bV5BitCount as usize;
+
+		// Each row of a DIB is padded out to a 4-byte boundary.
+		let Some(row_bits) = width.checked_mul(bit_count) else {
+			return 0;
+		};
+		let stride = (row_bits.saturating_add(31) / 32) * 4;
+		let Some(pixels_len) = stride.checked_mul(height) else {
+			return 0;
+		};
+
+		let needed = size_of::<BITMAPV5HEADER>()
+			.checked_add(MASK_LEN)
+			.and_then(|n| n.checked_add(pixels_len));
+
+		match needed {
+			Some(needed) if total_len >= needed => MASK_LEN,
+			_ => 0,
+		}
 	}
 
 	fn dibv5_alpha_format(header: &BITMAPV5HEADER) -> Dibv5AlphaFormat {
@@ -1274,6 +1321,43 @@ mod tests {
 		assert_eq!(image.width, 2);
 		assert_eq!(image.height, 1);
 		assert_eq!(image.bytes.as_ref(), &[0, 0, 0, 255, 0, 0, 0, 255]);
+	}
+
+	/// Rebuilds `dibv5_test_data` in the layout Windows actually produces when
+	/// it synthesises `CF_DIBV5`: the three `BI_BITFIELDS` masks are repeated
+	/// between the header and the pixel data.
+	fn dibv5_test_data_with_appended_masks(
+		width: usize,
+		height: usize,
+		alpha_mask: u32,
+		pixels: &[u8],
+	) -> Vec<u8> {
+		let base = dibv5_test_data(width, height, BI_BITFIELDS, alpha_mask, pixels);
+		let header_size = size_of::<BITMAPV5HEADER>();
+
+		let mut data = Vec::with_capacity(base.len() + 3 * size_of::<u32>());
+		data.extend_from_slice(&base[..header_size]);
+		for mask in [0x00ff_0000u32, 0x0000_ff00, 0x0000_00ff] {
+			data.extend_from_slice(&mask.to_le_bytes());
+		}
+		data.extend_from_slice(&base[header_size..]);
+		data
+	}
+
+	/// Regression test: reading the Windows-synthesised layout at `bV5Size`
+	/// consumed the mask block as pixels, shifting the image left by 3 pixels.
+	#[test]
+	fn read_cf_dibv5_skips_appended_bitfield_masks() {
+		let data =
+			dibv5_test_data_with_appended_masks(2, 1, 0xff000000, &[0, 0, 255, 0, 0, 255, 0, 0]);
+
+		let ImageData::Rgba(image) = read_cf_dibv5(&data).unwrap() else {
+			panic!("expected RGBA image");
+		};
+
+		assert_eq!(image.width, 2);
+		assert_eq!(image.height, 1);
+		assert_eq!(image.bytes.as_ref(), &[255, 0, 0, 0, 0, 255, 0, 0]);
 	}
 
 	#[test]
